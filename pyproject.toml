@@ -1,0 +1,23 @@
+[project]
+name = "meme-bot"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "aiogram>=3.13",
+    "sqlalchemy[asyncio]>=2.0",
+    "asyncpg>=0.29",
+    "alembic>=1.13",
+    "pydantic-settings>=2.4",
+    "imagehash>=4.3",
+    "pillow>=10.4",
+    "python-magic>=0.4.27",
+]
+
+[project.optional-dependencies]
+dev = ["psycopg2-binary>=2.9"]  # sync driver, alembic needs it for migrations
+
+[tool.setuptools]
+packages = ["bot", "bot.handlers", "bot.utils"]
+
+[tool.alembic]
+script_location = "db/migrations"
