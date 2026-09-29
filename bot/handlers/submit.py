@@ -1,10 +1,15 @@
+import asyncio
+from pathlib import Path
+
 from aiogram import Bot, F, Router
 from aiogram.filters import Command
 from aiogram.types import Message
-from sqlalchemy import select
+from sqlalchemy import func, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from bot.models import Meme, Tag
+from bot.config import settings
+from bot.models import Meme, Tag, normalize_tag_name
 from bot.utils.phash import compute_phash, find_duplicate
 
 router = Router(name="submit")
@@ -25,6 +30,31 @@ CAPTION_HELP = (
 @router.message(Command("submit"))
 async def submit_help(message: Message):
     await message.answer(CAPTION_HELP)
+
+
+async def get_or_create_tag(session: AsyncSession, raw_name: str) -> Tag:
+    """Race-safe get-or-create. Two concurrent /submit calls with the same new tag
+    used to both try to INSERT and one would hit IntegrityError unhandled, killing
+    the handler. ON CONFLICT DO NOTHING + re-select sidesteps that."""
+    name = normalize_tag_name(raw_name)
+
+    tag = await session.scalar(select(Tag).where(Tag.name == name))
+    if tag:
+        return tag
+
+    stmt = (
+        pg_insert(Tag)
+        .values(name=name)
+        # target the functional unique index on lower(name) directly, since that's the
+        # actual constraint (plain-column uniqueness was dropped in favor of it)
+        .on_conflict_do_nothing(index_elements=[func.lower(Tag.name)])
+    )
+    await session.execute(stmt)
+
+    # Either our insert landed, or a concurrent one did — either way it's there now.
+    tag = await session.scalar(select(Tag).where(Tag.name == name))
+    assert tag is not None
+    return tag
 
 
 @router.message(F.photo | F.animation | F.video | F.sticker)
@@ -49,22 +79,29 @@ async def handle_submission(message: Message, bot: Bot, session: AsyncSession):
         return
 
     phash = None
+    storage_path = None
     if media_type == "photo":
         file = await bot.get_file(file_obj.file_id)
         buf = await bot.download_file(file.file_path)
-        phash = compute_phash(buf.read())
+        raw = buf.read()
+
+        # CPU-bound (PIL decode + DCT) — keep it off the event loop or the whole bot
+        # stalls for every other chat while one submission is being hashed.
+        phash = await asyncio.to_thread(compute_phash, raw)
         dup = await find_duplicate(session, phash)
         if dup:
             await message.reply(f"Похоже на уже существующий мем (id={dup.id}).")
             return
 
-    tags = []
-    for tag_name in tag_names:
-        tag = await session.scalar(select(Tag).where(Tag.name == tag_name))
-        if not tag:
-            tag = Tag(name=tag_name)
-            session.add(tag)
-        tags.append(tag)
+        # file_id is not permanent (invalidated on Telegram-side server migrations,
+        # bot recreation, etc.) — keep our own copy now, while we already have the bytes,
+        # so old memes don't become unrecoverable later.
+        ext = Path(file.file_path).suffix or ".jpg"
+        storage_path = f"{file_obj.file_unique_id}{ext}"
+        full_path = settings.media_root / storage_path
+        await asyncio.to_thread(full_path.write_bytes, raw)
+
+    tags = [await get_or_create_tag(session, tag_name) for tag_name in tag_names]
 
     meme = Meme(
         file_id=file_obj.file_id,
@@ -75,6 +112,7 @@ async def handle_submission(message: Message, bot: Bot, session: AsyncSession):
         description=description,
         submitted_by=message.from_user.id,
         status="pending",
+        storage_path=storage_path,
         tags=tags,  # set at construction time — avoids a lazy-load on a persistent object later
     )
     session.add(meme)

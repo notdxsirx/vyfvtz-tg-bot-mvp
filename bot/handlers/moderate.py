@@ -1,6 +1,13 @@
 from aiogram import Bot, F, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import (
+    BufferedInputFile,
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -50,10 +57,22 @@ async def _send_next_pending(bot: Bot, chat_id: int, session: AsyncSession) -> N
 
     send = getattr(bot, method_name)
     kwargs = {"chat_id": chat_id, "reply_markup": _kb(meme.id)}
-    if meme.media_type == "sticker":
-        await send(sticker=meme.file_id, **kwargs)
-    else:
-        await send(**{f"{meme.media_type}": meme.file_id}, caption=_caption(meme), **kwargs)
+    media_kwargs = (
+        {"sticker": meme.file_id}
+        if meme.media_type == "sticker"
+        else {meme.media_type: meme.file_id, "caption": _caption(meme)}
+    )
+    try:
+        await send(**media_kwargs, **kwargs)
+    except TelegramBadRequest:
+        # file_id isn't permanent — if it's gone and we kept our own copy, fall back to that.
+        if not meme.storage_path:
+            await bot.send_message(chat_id, f"Файл недоступен и не сохранён локально, id={meme.id}")
+            return
+        full_path = settings.media_root / meme.storage_path
+        media = BufferedInputFile(full_path.read_bytes(), filename=meme.storage_path)
+        media_kwargs = {"sticker": media} if meme.media_type == "sticker" else {meme.media_type: media, "caption": _caption(meme)}
+        await send(**media_kwargs, **kwargs)
 
 
 @router.message(Command("moderate"))
